@@ -2,7 +2,7 @@ using RdmNet.Models;
 
 namespace RdmNet.Forms;
 
-public partial class ServerEditForm : Form
+public partial class ServerEditForm : AntdUI.BaseForm
 {
     /// <summary>供设计器使用。</summary>
     public ServerEditForm()
@@ -14,8 +14,16 @@ public partial class ServerEditForm : Form
     {
         InitializeComponent();
 
-        cboGroup.Items.AddRange(groupNames.ToArray());
-        cboGroup.Text = groupName;
+        ddGroup.Items.AddRange(groupNames.Cast<object>().ToArray());
+        ddGroup.SelectedValueChanged += (_, e) =>
+        {
+            if (e.Value?.ToString() is { Length: > 0 } name)
+            {
+                txtGroup.Text = name;
+            }
+        };
+
+        txtGroup.Text = groupName;
 
         if (server is null)
         {
@@ -39,7 +47,7 @@ public partial class ServerEditForm : Form
     {
         get
         {
-            string name = cboGroup.Text.Trim();
+            string name = txtGroup.Text.Trim();
             return name.Length == 0 ? ConnectionData.DefaultGroupName : name;
         }
     }
@@ -58,7 +66,7 @@ public partial class ServerEditForm : Form
     {
         if (Host.Length == 0)
         {
-            MessageBox.Show(this, "请输入 IP 地址或域名。", "服务器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            AntMessage.warn(this, "请输入 IP 地址或域名。");
             return;
         }
 

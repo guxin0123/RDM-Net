@@ -1,77 +1,87 @@
 namespace RdmNet.Forms;
 
 /// <summary>导入 / 导出时输入密码。导出时可选择不使用密码。</summary>
-public sealed class PasswordPromptForm : Form
+public sealed class PasswordPromptForm : AntdUI.BaseForm
 {
     private readonly bool _isExport;
-    private readonly CheckBox? _usePasswordCheckBox;
-    private readonly TextBox _passwordTextBox;
-    private readonly TextBox? _confirmTextBox;
+    private readonly AntCheckbox? _usePasswordCheckBox;
+    private readonly AntInput _passwordInput;
+    private readonly AntInput? _confirmInput;
+    private readonly AntLabel _passwordLabel;
+    private readonly AntLabel? _confirmLabel;
 
     private PasswordPromptForm(bool isExport)
     {
         _isExport = isExport;
-        int y = 18;
+        int y = 24;
 
         if (isExport)
         {
-            _usePasswordCheckBox = new CheckBox
+            _usePasswordCheckBox = new AntCheckbox
             {
                 Text = "使用密码加密导出的密码字段",
-                Location = new Point(18, y),
-                Size = new Size(360, 22),
+                AutoSize = false,
+                Location = new Point(24, y),
+                Size = new Size(360, 24),
             };
-            y += 30;
+            y += 36;
         }
 
-        var passwordLabel = new Label
+        _passwordLabel = new AntLabel
         {
             Text = isExport ? "导出密码：" : "导出时使用的密码：",
-            Location = new Point(18, y + 3),
-            Size = new Size(140, 20),
+            AutoSize = false,
+            Location = new Point(24, y),
+            Size = new Size(140, 36),
             TextAlign = ContentAlignment.MiddleLeft,
         };
-        _passwordTextBox = new TextBox
+        _passwordInput = new AntInput
         {
-            Location = new Point(162, y),
-            Size = new Size(226, 25),
+            Location = new Point(172, y),
+            Size = new Size(212, 36),
             UseSystemPasswordChar = true,
+            PasswordCopy = false,
+            PasswordPaste = false,
             Enabled = !isExport,
         };
-        y += 36;
+        y += 46;
 
         if (isExport)
         {
-            var confirmLabel = new Label
+            _confirmLabel = new AntLabel
             {
                 Text = "确认密码：",
-                Location = new Point(18, y + 3),
-                Size = new Size(140, 20),
+                AutoSize = false,
+                Location = new Point(24, y),
+                Size = new Size(140, 36),
                 TextAlign = ContentAlignment.MiddleLeft,
             };
-            _confirmTextBox = new TextBox
+            _confirmInput = new AntInput
             {
-                Location = new Point(162, y),
-                Size = new Size(226, 25),
+                Location = new Point(172, y),
+                Size = new Size(212, 36),
                 UseSystemPasswordChar = true,
+                PasswordCopy = false,
+                PasswordPaste = false,
                 Enabled = false,
             };
-            y += 36;
-
-            Controls.AddRange(new Control[] { confirmLabel, _confirmTextBox });
+            y += 46;
         }
 
-        var okButton = new Button
+        var okButton = new AntButton
         {
             Text = "确定",
-            Location = new Point(218, y + 6),
-            Size = new Size(80, 28),
+            Location = new Point(200, y + 8),
+            Size = new Size(88, 36),
+            Shape = AntTShape.Round,
+            Type = AntTTypeMini.Primary,
         };
-        var cancelButton = new Button
+        var cancelButton = new AntButton
         {
             Text = "取消",
-            Location = new Point(308, y + 6),
-            Size = new Size(80, 28),
+            Location = new Point(296, y + 8),
+            Size = new Size(88, 36),
+            Shape = AntTShape.Round,
             DialogResult = DialogResult.Cancel,
         };
 
@@ -80,10 +90,10 @@ public sealed class PasswordPromptForm : Form
             _usePasswordCheckBox.CheckedChanged += (_, _) =>
             {
                 bool enabled = _usePasswordCheckBox.Checked;
-                _passwordTextBox.Enabled = enabled;
-                if (_confirmTextBox is not null)
+                _passwordInput.Enabled = enabled;
+                if (_confirmInput is not null)
                 {
-                    _confirmTextBox.Enabled = enabled;
+                    _confirmInput.Enabled = enabled;
                 }
             };
         }
@@ -91,24 +101,30 @@ public sealed class PasswordPromptForm : Form
         okButton.Click += OnOk;
 
         AutoScaleMode = AutoScaleMode.Font;
-        ClientSize = new Size(405, y + 46);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        BackColor = Color.White;
+        ClientSize = new Size(408, y + 60);
         MaximizeBox = false;
         MinimizeBox = false;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
         Text = isExport ? "导出连接" : "导入连接";
-        Controls.AddRange(new Control[]
-        {
-            passwordLabel, _passwordTextBox, okButton, cancelButton,
-        });
-        if (_usePasswordCheckBox is not null)
-        {
-            Controls.Add(_usePasswordCheckBox);
-        }
-
         AcceptButton = okButton;
         CancelButton = cancelButton;
+
+        var controls = new List<Control> { _passwordLabel, _passwordInput, okButton, cancelButton };
+        if (_usePasswordCheckBox is not null)
+        {
+            controls.Add(_usePasswordCheckBox);
+        }
+
+        if (_confirmLabel is not null && _confirmInput is not null)
+        {
+            controls.Add(_confirmLabel);
+            controls.Add(_confirmInput);
+        }
+
+        Controls.AddRange(controls.ToArray());
     }
 
     /// <summary>导出时返回用户输入的密码；未启用加密时返回 null。</summary>
@@ -121,7 +137,7 @@ public sealed class PasswordPromptForm : Form
                 return null;
             }
 
-            return _passwordTextBox.Text.Length == 0 ? null : _passwordTextBox.Text;
+            return _passwordInput.Text.Length == 0 ? null : _passwordInput.Text;
         }
     }
 
@@ -135,22 +151,22 @@ public sealed class PasswordPromptForm : Form
         {
             if (_usePasswordCheckBox?.Checked == true)
             {
-                if (_passwordTextBox.Text.Length == 0)
+                if (_passwordInput.Text.Length == 0)
                 {
-                    MessageBox.Show(this, "请输入导出密码。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    AntMessage.warn(this, "请输入导出密码。");
                     return;
                 }
 
-                if (_confirmTextBox is not null && _confirmTextBox.Text != _passwordTextBox.Text)
+                if (_confirmInput is not null && _confirmInput.Text != _passwordInput.Text)
                 {
-                    MessageBox.Show(this, "两次输入的密码不一致。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    AntMessage.warn(this, "两次输入的密码不一致。");
                     return;
                 }
             }
         }
-        else if (_passwordTextBox.Text.Length == 0)
+        else if (_passwordInput.Text.Length == 0)
         {
-            MessageBox.Show(this, "请输入导出时使用的密码。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            AntMessage.warn(this, "请输入导出时使用的密码。");
             return;
         }
 

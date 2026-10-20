@@ -1,0 +1,20 @@
+// AntdUI 组件类型别名：避免与 System.Windows.Forms 中的同名类型
+// （Button / Label / Panel / Message / Menu / ContextMenuStrip 等）产生歧义。
+global using AntButton = AntdUI.Button;
+global using AntCheckbox = AntdUI.Checkbox;
+global using AntContextMenuItem = AntdUI.ContextMenuStripItem;
+global using AntContextMenuStrip = AntdUI.ContextMenuStrip;
+global using AntDropdown = AntdUI.Dropdown;
+global using AntInput = AntdUI.Input;
+global using AntInputNumber = AntdUI.InputNumber;
+global using AntLabel = AntdUI.Label;
+global using AntMessage = AntdUI.Message;
+global using AntModal = AntdUI.Modal;
+global using AntPanel = AntdUI.Panel;
+global using AntTAlign = AntdUI.TAlign;
+global using AntTAlignFrom = AntdUI.TAlignFrom;
+global using AntTree = AntdUI.Tree;
+global using AntTreeItem = AntdUI.TreeItem;
+global using AntTShape = AntdUI.TShape;
+global using AntTType = AntdUI.TType;
+global using AntTTypeMini = AntdUI.TTypeMini;

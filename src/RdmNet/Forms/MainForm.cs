@@ -1,39 +1,64 @@
 using System.Collections.Concurrent;
-using RdmNet.Controls;
 using RdmNet.Models;
 using RdmNet.Services;
+using RdmNet.Utils;
 
 namespace RdmNet.Forms;
 
-public partial class MainForm : Form
+public partial class MainForm : AntdUI.BaseForm
 {
+    private static readonly Color PendingColor = Color.FromArgb(0x8C, 0x8C, 0x8C);
+    private static readonly Color OnlineColor = Color.FromArgb(0x52, 0xC4, 0x1A);
+    private static readonly Color OfflineColor = Color.FromArgb(0xFF, 0x4D, 0x4F);
+    private static readonly Color SubtleColor = Color.FromArgb(0x8C, 0x8C, 0x8C);
+
     private readonly StorageService _storage = new();
     private readonly RdpLauncher _launcher = new();
     private readonly ExportService _exportService = new();
     private readonly Dictionary<string, LatencyResult> _latency = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, TreeNode> _serverNodes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, AntTreeItem> _serverNodes = new(StringComparer.Ordinal);
     private readonly ConcurrentQueue<LatencyUpdate> _latencyQueue = new();
     private readonly System.Windows.Forms.Timer _latencyTimer;
 
     private ConnectionsFile _data = new();
     private CancellationTokenSource? _scanCancellation;
     private int _scanGeneration;
-    private TreeNode? _dragNode;
-    private TreeNode? _dropNode;
-    private DropInsertMode _dropMode = DropInsertMode.None;
+    private AntTreeItem? _hoverItem;
+    private Form? _latencyTip;
     private bool _closing;
 
     public MainForm()
     {
         InitializeComponent();
+        ApplyToolbarIcons();
 
         _latencyTimer = new System.Windows.Forms.Timer { Interval = 200 };
         _latencyTimer.Tick += OnLatencyTimerTick;
 
-        tree.LatencyProvider = GetLatencyBadge;
-
         WireEvents();
         UpdateButtonStates();
+    }
+
+    /// <summary>工具栏按钮图标由 Segoe MDL2 字形运行时光栅化，不宜放在 InitializeComponent 中（设计器无法解析）。</summary>
+    private void ApplyToolbarIcons()
+    {
+        AntButton[] buttons = { btnAddGroup, btnAddServer, btnEditServer, btnDeleteServer, btnConnect, btnRefresh, btnImport, btnExport };
+        char[] glyphs = { ToolbarIcons.Folder, ToolbarIcons.Server, ToolbarIcons.Edit, ToolbarIcons.Delete, ToolbarIcons.Monitor, ToolbarIcons.Refresh, ToolbarIcons.Download, ToolbarIcons.Upload };
+
+        for (int i = 0; i < buttons.Length; i++)
+        {
+            Bitmap? icon = CreateIcon(glyphs[i]);
+            if (icon is not null)
+            {
+                buttons[i].Icon = icon;
+            }
+        }
+    }
+
+    /// <summary>树节点承载的数据：服务器节点同时持有所属分组。</summary>
+    private sealed record NodeTag(ConnectionGroup Group, ConnectionServer? Server)
+    {
+        public bool IsGroup => Server is null;
     }
 
     private void WireEvents()
@@ -50,21 +75,13 @@ public partial class MainForm : Form
         btnImport.Click += OnImport;
         btnExport.Click += OnExport;
 
-        miConnect.Click += OnConnectClicked;
-        miEditServer.Click += OnEditServer;
-        miDeleteServer.Click += OnDeleteServer;
-        miAddServer.Click += OnAddServer;
-        miRenameGroup.Click += OnRenameGroup;
-        miDeleteGroup.Click += OnDeleteGroup;
-
-        tree.AfterSelect += (_, _) => UpdateButtonStates();
+        tree.SelectChanged += (_, _) => UpdateButtonStates();
         tree.NodeMouseClick += OnNodeMouseClick;
         tree.NodeMouseDoubleClick += OnNodeMouseDoubleClick;
-        tree.BeforeLabelEdit += OnBeforeLabelEdit;
-        tree.AfterLabelEdit += OnAfterLabelEdit;
-        tree.ItemDrag += OnItemDrag;
-        tree.DragOver += OnDragOver;
-        tree.DragDrop += OnDragDrop;
+        tree.Drop += OnTreeDrop;
+        tree.DropDone += OnTreeDropDone;
+        tree.NodeMouseMove += OnNodeHover;
+        tree.MouseLeave += (_, _) => CloseLatencyTip();
     }
 
     private void OnFormLoad(object? sender, EventArgs e)
@@ -99,6 +116,7 @@ public partial class MainForm : Form
         _closing = true;
         _latencyTimer.Stop();
         _scanCancellation?.Cancel();
+        _latencyTip?.Close();
 
         try
         {
@@ -114,63 +132,78 @@ public partial class MainForm : Form
 
     private void RebuildTree()
     {
-        string? keepServerId = (tree.SelectedNode?.Tag as TreeItem)?.Server?.Id;
+        string? keepServerId = SelectedItem?.Server?.Id;
 
-        tree.BeginUpdate();
-        try
+        CloseLatencyTip();
+        tree.Items.Clear();
+        _serverNodes.Clear();
+
+        foreach (ConnectionGroup group in _data.Groups)
         {
-            tree.Nodes.Clear();
-            _serverNodes.Clear();
-
-            foreach (ConnectionGroup group in _data.Groups)
+            var groupItem = new AntTreeItem(group.Name)
             {
-                var groupNode = new TreeNode(group.Name) { Tag = new TreeItem(group, null) };
-                foreach (ConnectionServer server in group.Servers)
-                {
-                    var serverNode = new TreeNode(server.Name) { Tag = new TreeItem(group, server) };
-                    ApplyLatencyTooltip(serverNode, GetLatency(server.Id));
-                    _serverNodes[server.Id] = serverNode;
-                    groupNode.Nodes.Add(serverNode);
-                }
+                Icon = CreateIcon(ToolbarIcons.Folder),
+                Tag = new NodeTag(group, null),
+            };
 
-                tree.Nodes.Add(groupNode);
+            foreach (ConnectionServer server in group.Servers)
+            {
+                var serverItem = new AntTreeItem(server.Name)
+                {
+                    BadgeAlign = AntTAlign.Right,
+                    BadgeOffsetX = BadgeRightMargin,
+                    ForeSub = SubtleColor,
+                    Icon = CreateIcon(ToolbarIcons.Server),
+                    SubTitle = FormatHost(server),
+                    Tag = new NodeTag(group, server),
+                };
+                ApplyLatency(serverItem, server.Id);
+                _serverNodes[server.Id] = serverItem;
+                groupItem.Sub.Add(serverItem);
             }
 
-            tree.ApplyNodeImages();
-            tree.ExpandAll();
-        }
-        finally
-        {
-            tree.EndUpdate();
+            tree.Items.Add(groupItem);
         }
 
-        if (keepServerId is not null && _serverNodes.TryGetValue(keepServerId, out TreeNode? node))
+        tree.ExpandAll(true);
+
+        if (keepServerId is not null && _serverNodes.TryGetValue(keepServerId, out AntTreeItem? node))
         {
-            tree.SelectedNode = node;
+            tree.Select(node, true);
         }
 
-        tree.Invalidate();
         UpdateButtonStates();
+    }
+
+    /// <summary>按当前 DPI 生成节点图标位图（每次新建，避免被控件释放后复用失效）。</summary>
+    private static Bitmap? CreateIcon(char glyph)
+    {
+        Bitmap? source = ToolbarIcons.Get(glyph, 16);
+        return source is null ? null : (Bitmap)source.Clone();
     }
 
     /// <summary>按树上现有顺序回写模型并保存。</summary>
     private void PersistTreeOrder()
     {
         var groups = new List<ConnectionGroup>();
-        foreach (TreeNode groupNode in tree.Nodes)
+        foreach (AntTreeItem groupItem in tree.Items)
         {
-            if (groupNode.Tag is not TreeItem item)
+            if (groupItem.Tag is not NodeTag { Group: { } group })
             {
                 continue;
             }
 
-            item.Group.Servers = groupNode.Nodes
-                .OfType<TreeNode>()
-                .Select(n => (n.Tag as TreeItem)?.Server)
-                .Where(s => s is not null)
-                .Cast<ConnectionServer>()
-                .ToList();
-            groups.Add(item.Group);
+            var servers = new List<ConnectionServer>();
+            foreach (AntTreeItem serverItem in groupItem.Sub)
+            {
+                if (serverItem.Tag is NodeTag { Server: { } server })
+                {
+                    servers.Add(server);
+                }
+            }
+
+            group.Servers = servers;
+            groups.Add(group);
         }
 
         _data.Groups = groups;
@@ -189,14 +222,13 @@ public partial class MainForm : Form
         }
     }
 
-    private TreeItem? SelectedItem => tree.SelectedNode?.Tag as TreeItem;
+    private NodeTag? SelectedItem => tree.SelectItem?.Tag as NodeTag;
 
     private void SelectServer(string serverId)
     {
-        if (_serverNodes.TryGetValue(serverId, out TreeNode? node))
+        if (_serverNodes.TryGetValue(serverId, out AntTreeItem? item))
         {
-            tree.SelectedNode = node;
-            node.EnsureVisible();
+            tree.Select(item, true);
         }
     }
 
@@ -223,13 +255,13 @@ public partial class MainForm : Form
         string name = input.Trim();
         if (name.Length == 0)
         {
-            MessageBox.Show(this, "分组名称不能为空。", "新增分组", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Notify("分组名称不能为空。", AntTType.Warn);
             return;
         }
 
         if (ConnectionData.GroupNameExists(_data, name))
         {
-            MessageBox.Show(this, $"分组“{name}”已存在。", "新增分组", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Notify($"分组“{name}”已存在。", AntTType.Warn);
             return;
         }
 
@@ -240,10 +272,32 @@ public partial class MainForm : Form
 
     private void OnRenameGroup(object? sender, EventArgs e)
     {
-        if (SelectedItem is { IsGroup: true })
+        if (SelectedItem is not { Group: { } group })
         {
-            tree.SelectedNode?.BeginEdit();
+            return;
         }
+
+        string? input = InputDialog.Show(this, "重命名分组", "分组名称：", group.Name);
+        if (input is null)
+        {
+            return;
+        }
+
+        string name = input.Trim();
+        if (string.Equals(name, group.Name, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (ConnectionData.GroupNameExists(_data, name, group))
+        {
+            Notify($"分组“{name}”已存在。", AntTType.Warn);
+            return;
+        }
+
+        group.Name = name;
+        SaveData();
+        RebuildTree();
     }
 
     private void OnDeleteGroup(object? sender, EventArgs e)
@@ -255,14 +309,14 @@ public partial class MainForm : Form
 
         if (string.Equals(group.Name, ConnectionData.DefaultGroupName, StringComparison.Ordinal))
         {
-            MessageBox.Show(this, "默认分组不能删除。", "删除分组", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Notify("默认分组不能删除。", AntTType.Info);
             return;
         }
 
         string message = group.Servers.Count == 0
             ? $"确定删除分组“{group.Name}”吗？"
             : $"确定删除分组“{group.Name}”吗？组内 {group.Servers.Count} 台服务器将移入默认分组。";
-        if (MessageBox.Show(this, message, "删除分组", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+        if (!Confirm("删除分组", message))
         {
             return;
         }
@@ -270,41 +324,6 @@ public partial class MainForm : Form
         ConnectionData.RemoveGroup(_data, group);
         SaveData();
         RebuildTree();
-    }
-
-    private void OnBeforeLabelEdit(object? sender, NodeLabelEditEventArgs e)
-    {
-        if (e.Node?.Tag is not TreeItem { IsGroup: true })
-        {
-            e.CancelEdit = true;
-        }
-    }
-
-    private void OnAfterLabelEdit(object? sender, NodeLabelEditEventArgs e)
-    {
-        if (e.Label is null || e.Node?.Tag is not TreeItem { Group: { } group })
-        {
-            e.CancelEdit = true;
-            return;
-        }
-
-        string name = e.Label.Trim();
-        if (name.Length == 0)
-        {
-            e.CancelEdit = true;
-            MessageBox.Show(this, "分组名称不能为空。", "重命名分组", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        if (ConnectionData.GroupNameExists(_data, name, group))
-        {
-            e.CancelEdit = true;
-            MessageBox.Show(this, $"分组“{name}”已存在。", "重命名分组", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        group.Name = name;
-        SaveData();
     }
 
     private void OnAddServer(object? sender, EventArgs e)
@@ -338,7 +357,7 @@ public partial class MainForm : Form
     {
         if (SelectedItem is not { Server: { } server, Group: { } group })
         {
-            MessageBox.Show(this, "请先选择一个服务器。", "编辑服务器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Notify("请先选择一个服务器。", AntTType.Info);
             return;
         }
 
@@ -351,7 +370,7 @@ public partial class MainForm : Form
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, $"无法解密已保存的密码，请重新输入。\n{ex.Message}", "编辑服务器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Notify($"无法解密已保存的密码，请重新输入。{ex.Message}", AntTType.Warn);
             }
         }
 
@@ -390,7 +409,7 @@ public partial class MainForm : Form
             return;
         }
 
-        if (MessageBox.Show(this, $"确定删除服务器“{server.Name}”吗？", "删除服务器", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+        if (!Confirm("删除服务器", $"确定删除服务器“{server.Name}”吗？"))
         {
             return;
         }
@@ -424,33 +443,91 @@ public partial class MainForm : Form
 
     #region 右键菜单
 
-    private void OnNodeMouseClick(object? sender, TreeNodeMouseClickEventArgs e)
+    private void OnNodeMouseClick(object? sender, AntdUI.TreeSelectEventArgs e)
     {
-        if (e.Button != MouseButtons.Right || e.Node is null)
+        if (e.Button != MouseButtons.Right || e.Item?.Tag is not NodeTag tag)
         {
             return;
         }
 
-        tree.SelectedNode = e.Node;
-        if (e.Node.Tag is not TreeItem item)
-        {
-            return;
-        }
+        tree.Select(e.Item, false);
 
-        if (item.IsGroup)
+        if (tag.IsGroup)
         {
-            miDeleteGroup.Enabled = !string.Equals(item.Group.Name, ConnectionData.DefaultGroupName, StringComparison.Ordinal);
-            groupMenu.Show(tree, e.Location);
+            bool canDelete = !string.Equals(tag.Group.Name, ConnectionData.DefaultGroupName, StringComparison.Ordinal);
+            AntContextMenuStrip.open(
+                tree,
+                OnGroupMenuClick,
+                new AntdUI.IContextMenuStripItem[]
+                {
+                    CreateMenuItem("add-server", "新增服务器", ToolbarIcons.Server),
+                    CreateMenuItem("rename-group", "重命名分组", ToolbarIcons.Edit),
+                    CreateMenuItem("delete-group", "删除分组", ToolbarIcons.Delete, canDelete),
+                },
+                0);
         }
         else
         {
-            serverMenu.Show(tree, e.Location);
+            AntContextMenuStrip.open(
+                tree,
+                OnServerMenuClick,
+                new AntdUI.IContextMenuStripItem[]
+                {
+                    CreateMenuItem("connect", "连接", ToolbarIcons.Monitor),
+                    CreateMenuItem("edit-server", "编辑服务器", ToolbarIcons.Edit),
+                    CreateMenuItem("delete-server", "删除服务器", ToolbarIcons.Delete),
+                },
+                0);
         }
     }
 
-    private void OnNodeMouseDoubleClick(object? sender, TreeNodeMouseClickEventArgs e)
+    private static AntContextMenuItem CreateMenuItem(string id, string text, char glyph, bool enabled = true)
     {
-        if (e.Node?.Tag is TreeItem { Server: { } server })
+        var item = new AntContextMenuItem(text) { Enabled = enabled, ID = id };
+        Bitmap? icon = ToolbarIcons.Get(glyph, 16);
+        if (icon is not null)
+        {
+            item.Icon = (Bitmap)icon.Clone();
+        }
+
+        return item;
+    }
+
+    private void OnGroupMenuClick(AntdUI.IContextMenuStrip item)
+    {
+        switch (item.ID)
+        {
+            case "add-server":
+                OnAddServer(this, EventArgs.Empty);
+                break;
+            case "rename-group":
+                OnRenameGroup(this, EventArgs.Empty);
+                break;
+            case "delete-group":
+                OnDeleteGroup(this, EventArgs.Empty);
+                break;
+        }
+    }
+
+    private void OnServerMenuClick(AntdUI.IContextMenuStrip item)
+    {
+        switch (item.ID)
+        {
+            case "connect":
+                OnConnectClicked(this, EventArgs.Empty);
+                break;
+            case "edit-server":
+                OnEditServer(this, EventArgs.Empty);
+                break;
+            case "delete-server":
+                OnDeleteServer(this, EventArgs.Empty);
+                break;
+        }
+    }
+
+    private void OnNodeMouseDoubleClick(object? sender, AntdUI.TreeSelectEventArgs e)
+    {
+        if (e.Item?.Tag is NodeTag { Server: { } server })
         {
             ConnectAsync(server);
         }
@@ -464,7 +541,7 @@ public partial class MainForm : Form
     {
         if (SelectedItem is not { Server: { } server })
         {
-            MessageBox.Show(this, "请先选择一个服务器。", "连接", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Notify("请先选择一个服务器。", AntTType.Info);
             return;
         }
 
@@ -484,18 +561,18 @@ public partial class MainForm : Form
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show(this, $"无法解密已保存的密码，将改为手动输入。\n{ex.Message}", "连接", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    Notify($"无法解密已保存的密码，将改为手动输入。{ex.Message}", AntTType.Warn);
                 }
             }
 
             ConnectOutcome outcome = await _launcher.ConnectAsync(server, plainPassword);
             if (!outcome.Started)
             {
-                MessageBox.Show(this, outcome.Message ?? "连接失败。", "连接失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Notify(outcome.Message ?? "连接失败。", AntTType.Error);
             }
             else if (!string.IsNullOrEmpty(outcome.Message))
             {
-                MessageBox.Show(this, outcome.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                Notify(outcome.Message, AntTType.Warn);
             }
         }
         catch (Exception ex)
@@ -513,27 +590,67 @@ public partial class MainForm : Form
         return _latency.TryGetValue(serverId, out LatencyResult result) ? result : null;
     }
 
-    private LatencyBadge? GetLatencyBadge(TreeNode node)
+    /// <summary>把延迟探测结果写回节点右侧徽标。</summary>
+    private void ApplyLatency(AntTreeItem item, string serverId)
     {
-        if (node.Tag is not TreeItem { Server: { } server })
+        if (!_latency.TryGetValue(serverId, out LatencyResult result))
         {
-            return null;
+            return;
         }
 
-        return _latency.TryGetValue(server.Id, out LatencyResult result)
-            ? result.State switch
-            {
-                LatencyState.Pending => new LatencyBadge("…", SystemColors.GrayText),
-                LatencyState.Online => new LatencyBadge($"{result.Milliseconds} ms", SystemColors.ControlText),
-                LatencyState.Offline => new LatencyBadge("离线", Color.Firebrick),
-                _ => null,
-            }
-            : null;
+        (string text, Color color) = result.State switch
+        {
+            LatencyState.Pending => ("…", PendingColor),
+            LatencyState.Online => ($"{result.Milliseconds} ms", OnlineColor),
+            _ => ("离线", OfflineColor),
+        };
+
+        item.SetBadge(text);
+        item.SetBadgeBack(color);
+        item.SetBadgeFore(Color.White);
     }
 
-    private static void ApplyLatencyTooltip(TreeNode node, LatencyResult? result)
+    /// <summary>地址列文本：默认端口只显示地址，非默认端口附带端口号。</summary>
+    private static string FormatHost(ConnectionServer server) =>
+        server.Port == ConnectionServer.DefaultPort ? server.Host : $"{server.Host}:{server.Port}";
+
+    /// <summary>延迟徽标距行右边缘的间距（按 DPI 缩放），避免与滚动条重叠。</summary>
+    private int BadgeRightMargin => (int)Math.Round(16 * (tree.DeviceDpi / 96.0));
+
+    /// <summary>悬停到探测失败的服务器时，在光标处展示失败原因。</summary>
+    private void OnNodeHover(object? sender, AntdUI.TreeHoverEventArgs e)
     {
-        node.ToolTipText = result is { State: LatencyState.Offline, Detail: not null } value ? value.Detail : string.Empty;
+        if (!e.Hover || e.Item?.Tag is not NodeTag { Server: not null } tag)
+        {
+            CloseLatencyTip();
+            return;
+        }
+
+        if (ReferenceEquals(e.Item, _hoverItem))
+        {
+            return;
+        }
+
+        CloseLatencyTip();
+        if (GetLatency(tag.Server.Id) is not { State: LatencyState.Offline, Detail: { Length: > 0 } detail })
+        {
+            return;
+        }
+
+        // 徽标固定在行右侧，锚定到该区域而不是整行，避免提示浮在名称上方。
+        int anchorWidth = Math.Min(96, e.Rect.Width);
+        var anchor = new Rectangle(e.Rect.Right - anchorWidth, e.Rect.Top, anchorWidth, e.Rect.Height);
+
+        _hoverItem = e.Item;
+        _latencyTip = AntdUI.Tooltip.open(tree, detail, anchor, AntTAlign.Top);
+    }
+
+    private void CloseLatencyTip()
+    {
+        _hoverItem = null;
+        Form? tip = _latencyTip;
+        _latencyTip = null;
+        tip?.Close();
     }
 
     private void RefreshLatency()
@@ -544,17 +661,18 @@ public partial class MainForm : Form
         _scanCancellation = cancellation;
         int generation = ++_scanGeneration;
 
+        CloseLatencyTip();
+
         List<ConnectionServer> servers = ConnectionData.AllServers(_data).ToList();
         foreach (ConnectionServer server in servers)
         {
             _latency[server.Id] = new LatencyResult(LatencyState.Pending, 0, null);
-            if (_serverNodes.TryGetValue(server.Id, out TreeNode? node))
+            if (_serverNodes.TryGetValue(server.Id, out AntTreeItem? item))
             {
-                node.ToolTipText = string.Empty;
+                ApplyLatency(item, server.Id);
             }
         }
 
-        tree.Invalidate();
         if (servers.Count == 0)
         {
             return;
@@ -585,9 +703,9 @@ public partial class MainForm : Form
             }
 
             _latency[update.ServerId] = update.Result;
-            if (_serverNodes.TryGetValue(update.ServerId, out TreeNode? node))
+            if (_serverNodes.TryGetValue(update.ServerId, out AntTreeItem? item))
             {
-                ApplyLatencyTooltip(node, update.Result);
+                ApplyLatency(item, update.ServerId);
             }
 
             changed = true;
@@ -603,136 +721,28 @@ public partial class MainForm : Form
 
     #region 拖拽排序
 
-    private void OnItemDrag(object? sender, ItemDragEventArgs e)
+    private void OnTreeDrop(object? sender, AntdUI.TreeDropEventArgs e)
     {
-        if (e.Item is not TreeNode node)
-        {
-            return;
-        }
-
-        _dragNode = node;
-        try
-        {
-            tree.DoDragDrop(node, DragDropEffects.Move);
-        }
-        finally
-        {
-            _dragNode = null;
-            _dropNode = null;
-            _dropMode = DropInsertMode.None;
-            tree.ClearDropIndicator();
-        }
+        // 分组只能在顶层分组之间排序；服务器只能停留在某个分组内部。
+        bool valid = e.DragNode?.Tag is NodeTag dragged
+            && (dragged.IsGroup
+                ? e.TargetParent is null
+                : e.TargetParent?.Tag is NodeTag { IsGroup: true });
+        e.Cancel = !valid;
     }
 
-    private void OnDragOver(object? sender, DragEventArgs e)
+    private void OnTreeDropDone(object? sender, AntdUI.TreeDropDoneEventArgs e)
     {
-        e.Effect = DragDropEffects.None;
-        if (_dragNode is null)
-        {
-            return;
-        }
+        string? serverId = (e.DragNode?.Tag as NodeTag)?.Server?.Id;
 
-        Point point = tree.PointToClient(new Point(e.X, e.Y));
-        TreeNode? target = tree.GetNodeAt(point);
-        DropInsertMode mode = ResolveDropMode(_dragNode, target, point);
-        if (mode == DropInsertMode.None || target is null)
-        {
-            _dropNode = null;
-            _dropMode = DropInsertMode.None;
-            tree.ClearDropIndicator();
-            return;
-        }
-
-        _dropNode = target;
-        _dropMode = mode;
-        e.Effect = DragDropEffects.Move;
-        tree.SetDropIndicator(target, mode);
-    }
-
-    private void OnDragDrop(object? sender, DragEventArgs e)
-    {
-        TreeNode? dragged = _dragNode;
-        TreeNode? target = _dropNode;
-        DropInsertMode mode = _dropMode;
-
-        _dropNode = null;
-        _dropMode = DropInsertMode.None;
-        tree.ClearDropIndicator();
-
-        if (dragged is null || target is null || mode == DropInsertMode.None)
-        {
-            return;
-        }
-
-        if (mode == DropInsertMode.AsChild)
-        {
-            dragged.Remove();
-            target.Nodes.Add(dragged);
-            target.Expand();
-        }
-        else
-        {
-            TreeNodeCollection siblings = target.Parent is null ? tree.Nodes : target.Parent.Nodes;
-            bool sameParent = ReferenceEquals(target.Parent, dragged.Parent);
-            int index = target.Index + (mode == DropInsertMode.After ? 1 : 0);
-            if (sameParent && dragged.Index < target.Index)
-            {
-                index--;
-            }
-
-            dragged.Remove();
-            siblings.Insert(index, dragged);
-        }
-
+        // 拖动后节点上的分组引用可能已过期，按当前顺序回写模型后重建，保证数据一致。
         PersistTreeOrder();
-        tree.SelectedNode = dragged;
-        dragged.EnsureVisible();
-    }
+        RebuildTree();
 
-    private static DropInsertMode ResolveDropMode(TreeNode dragged, TreeNode? target, Point point)
-    {
-        if (target is null || ReferenceEquals(target, dragged))
+        if (serverId is not null)
         {
-            return DropInsertMode.None;
+            SelectServer(serverId);
         }
-
-        if (dragged.Tag is not TreeItem draggedItem || target.Tag is not TreeItem targetItem)
-        {
-            return DropInsertMode.None;
-        }
-
-        // 分组只能在分组之间并列排序，不能放入分组内部。
-        if (draggedItem.IsGroup)
-        {
-            if (!targetItem.IsGroup)
-            {
-                return DropInsertMode.None;
-            }
-
-            return point.Y < target.Bounds.Top + (target.Bounds.Height / 2) ? DropInsertMode.Before : DropInsertMode.After;
-        }
-
-        // 服务器拖到分组上：放入该分组末尾。
-        if (targetItem.IsGroup)
-        {
-            return DropInsertMode.AsChild;
-        }
-
-        // 服务器之间：在目标所在分组内排序，或移动到目标所在分组。
-        DropInsertMode vertical = point.Y < target.Bounds.Top + (target.Bounds.Height / 2) ? DropInsertMode.Before : DropInsertMode.After;
-        if (ReferenceEquals(target.Parent, dragged.Parent))
-        {
-            int draggedIndex = dragged.Index;
-            int targetIndex = target.Index;
-            if (targetIndex == draggedIndex
-                || (vertical == DropInsertMode.Before && targetIndex == draggedIndex + 1)
-                || (vertical == DropInsertMode.After && targetIndex == draggedIndex - 1))
-            {
-                return DropInsertMode.None;
-            }
-        }
-
-        return vertical;
     }
 
     #endregion
@@ -770,19 +780,14 @@ public partial class MainForm : Form
             ImportResult result = _exportService.Import(dialog.FileName, password, _data, ResolveConflict);
             if (result.Canceled)
             {
-                MessageBox.Show(this, "导入已中止，未保存任何更改。", "导入连接", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                Notify("导入已中止，未保存任何更改。", AntTType.Info);
                 return;
             }
 
             SaveData();
             RebuildTree();
             RefreshLatency();
-            MessageBox.Show(
-                this,
-                $"导入完成：新增 {result.ServersAdded} 台，覆盖 {result.ServersOverwritten} 台，跳过 {result.ServersSkipped} 台。",
-                "导入连接",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            Notify($"导入完成：新增 {result.ServersAdded} 台，覆盖 {result.ServersOverwritten} 台，跳过 {result.ServersSkipped} 台。", AntTType.Success);
         }
         catch (Exception ex)
         {
@@ -814,9 +819,9 @@ public partial class MainForm : Form
         {
             ExportResult result = _exportService.Export(_data, dialog.FileName, prompt.Password);
             string message = result.ServersSkipped > 0
-                ? $"导出完成。\n其中 {result.ServersSkipped} 台服务器的密码无法解密，未包含在导出文件中。"
+                ? $"导出完成。其中 {result.ServersSkipped} 台服务器的密码无法解密，未包含在导出文件中。"
                 : "导出完成。";
-            MessageBox.Show(this, message, "导出连接", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Notify(message, result.ServersSkipped > 0 ? AntTType.Warn : AntTType.Success);
         }
         catch (Exception ex)
         {
@@ -826,12 +831,18 @@ public partial class MainForm : Form
 
     private ConflictAction ResolveConflict(ConnectionGroup group, ConnectionServer existing, ConnectionServer incoming)
     {
-        DialogResult result = MessageBox.Show(
+        DialogResult result = AntModal.open(new AntdUI.Modal.Config(
             this,
-            $"分组“{group.Name}”中已存在服务器“{existing.Name}”。\n\n是：用导入的数据覆盖\n否：跳过该服务器\n取消：中止导入",
             "服务器重名",
-            MessageBoxButtons.YesNoCancel,
-            MessageBoxIcon.Question);
+            $"分组“{group.Name}”中已存在服务器“{existing.Name}”。\n\n覆盖：用导入的数据替换；跳过：保留现有数据；中止：停止导入且不保存。")
+        {
+            Btns = new[]
+            {
+                new AntdUI.Modal.Btn("overwrite", "覆盖", AntTTypeMini.Primary) { DialogResult = DialogResult.Yes },
+                new AntdUI.Modal.Btn("skip", "跳过", AntTTypeMini.Default) { DialogResult = DialogResult.No },
+                new AntdUI.Modal.Btn("abort", "中止导入", AntTTypeMini.Error) { DialogResult = DialogResult.Cancel },
+            },
+        });
 
         return result switch
         {
@@ -843,10 +854,36 @@ public partial class MainForm : Form
 
     #endregion
 
+    #region 提示
+
+    private void Notify(string text, AntTType type)
+    {
+        switch (type)
+        {
+            case AntTType.Success:
+                AntMessage.success(this, text);
+                break;
+            case AntTType.Warn:
+                AntMessage.warn(this, text);
+                break;
+            case AntTType.Error:
+                AntMessage.error(this, text);
+                break;
+            default:
+                AntMessage.info(this, text);
+                break;
+        }
+    }
+
+    private bool Confirm(string title, string content) =>
+        AntModal.open(this, title, content, AntTType.Warn) == DialogResult.OK;
+
     private void ShowError(string title, Exception exception)
     {
-        MessageBox.Show(this, exception.Message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        Notify($"{title}：{exception.Message}", AntTType.Error);
     }
+
+    #endregion
 
     private readonly record struct LatencyUpdate(int Generation, string ServerId, LatencyResult Result);
 }
